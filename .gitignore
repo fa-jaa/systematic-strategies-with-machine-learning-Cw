@@ -78,3 +78,10 @@ dmypy.json
 
 # Project generated artifacts
 data/features/technical_analysis_features.csv
+data/hmm/
+data/features/all_technical_features.csv
+data/features/merged_feature_matrix.csv
+data/features/feature_catalog.csv
+data/features/categorical_feature_mappings.csv
+data/features/*_clean_feature_set.csv
+data/features/tripple_barrier/
