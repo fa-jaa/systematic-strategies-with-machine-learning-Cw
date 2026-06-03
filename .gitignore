@@ -76,5 +76,7 @@ dmypy.json
 .idea/
 .vscode/
 
-# Project generated artifacts
-data/features/technical_analysis_features.csv
+# Project data outputs
+data/**/*.csv
+!data/raw/
+!data/raw/*.csv
