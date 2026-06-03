@@ -58,6 +58,7 @@ ipython_config.py
 .env
 .envrc
 .venv
+.uv-cache/
 env/
 venv/
 ENV/
@@ -76,9 +77,7 @@ dmypy.json
 .idea/
 .vscode/
 
-# Project generated artifacts
-data/hmm/
-data/features/tripple_barrier/
+# Project data outputs
 data/**/*.csv
 !data/raw/
 !data/raw/*.csv
