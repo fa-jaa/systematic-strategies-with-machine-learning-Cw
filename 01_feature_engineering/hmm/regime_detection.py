@@ -156,7 +156,7 @@ def run_regime_detection(config: RegimeConfig = RegimeConfig()) -> pd.DataFrame:
     regimes = pd.concat(frames, ignore_index=True).sort_values(["date", "instrument"])
     regimes["hmm_predicted_regime"] = regimes["hmm_predicted_regime"].astype("Int64")
 
-    output_dir = Path("data/hmm/predictions")
+    output_dir = Path("data/features/hmm/predictions")
     output_dir.mkdir(parents=True, exist_ok=True)
     regimes.to_csv(output_dir / "latent_regime_predictions.csv", index=False)
     return regimes

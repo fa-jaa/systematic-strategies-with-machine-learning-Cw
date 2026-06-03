@@ -17,7 +17,7 @@ from pathlib import Path
 import pandas as pd
 
 
-HMM_ROOT = Path("data/hmm")
+HMM_ROOT = Path("data/features/hmm")
 PREDICTION_DIR = HMM_ROOT / "predictions"
 CATEGORY_DIR = HMM_ROOT / "categories"
 PROBABILITY_DIR = HMM_ROOT / "probabilities"
