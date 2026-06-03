@@ -22,14 +22,14 @@ How to import it
 ----------------
 Because the folder name starts with `02_`, this is not valid Python:
 
-    from 02_tripple_barrier.tripple_barrier import run_triple_barrier_pipeline
+    from 02_triple_barrier.triple_barrier import run_triple_barrier_pipeline
 
 Instead, add the folder to `sys.path` first:
 
     import sys
-    sys.path.append("02_tripple_barrier")
+    sys.path.append("02_triple_barrier")
 
-    from tripple_barrier import run_triple_barrier_pipeline
+    from triple_barrier import run_triple_barrier_pipeline
 
 Basic use
 ---------
@@ -68,7 +68,7 @@ By default the function does not write files, which is better for CPCV loops.
 Pass `output_path` only when you want a CSV:
 
     labels = run_triple_barrier_pipeline(
-        output_path="data/features/tripple_barrier/cl1s_labels.csv"
+        output_path="data/features/triple_barrier/cl1s_labels.csv"
     )
 
 Important output columns
