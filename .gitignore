@@ -85,3 +85,7 @@ data/**/*.csv
 # Keep curated result tables under version control
 !results/
 !results/*.csv
+
+# Keep final submission deliverables under version control
+!deliverables/
+!deliverables/*.csv

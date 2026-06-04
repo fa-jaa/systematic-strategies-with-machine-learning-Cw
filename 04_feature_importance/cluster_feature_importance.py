@@ -175,6 +175,28 @@ def clean_scalar(value: Any) -> Any:
     return value
 
 
+def to_jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): to_jsonable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [to_jsonable(item) for item in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return None if np.isnan(value) else float(value)
+    if isinstance(value, np.ndarray):
+        return to_jsonable(value.tolist())
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if pd.isna(value):
+        return None
+    return value
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(to_jsonable(value), sort_keys=True)
+
+
 def read_model_comparison(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(
@@ -367,6 +389,8 @@ def apply_feature_processing(
                 "scaler": pca_scaler,
                 "feature_columns": pca_cols,
                 "component_columns": component_cols,
+                "clip_lower": lower[pca_cols],
+                "clip_upper": upper[pca_cols],
             },
         }
 
@@ -374,8 +398,13 @@ def apply_feature_processing(
 
 
 def make_logistic_model(row: pd.Series) -> LogisticRegression:
+    params = logistic_model_params(row)
+    return LogisticRegression(**params)
+
+
+def logistic_model_params(row: pd.Series) -> dict[str, Any]:
     penalty = row["penalty"]
-    params = {
+    params: dict[str, Any] = {
         "penalty": penalty,
         "C": float(row["C"]),
         "class_weight": clean_scalar(row.get("class_weight", "balanced")),
@@ -392,10 +421,15 @@ def make_logistic_model(row: pd.Series) -> LogisticRegression:
         params["random_state"] = RANDOM_STATE
     else:
         raise ValueError(f"Unsupported logistic penalty: {penalty}")
-    return LogisticRegression(**params)
+    return params
 
 
 def make_rf_model(row: pd.Series) -> RandomForestClassifier:
+    params = rf_model_params(row)
+    return RandomForestClassifier(**params)
+
+
+def rf_model_params(row: pd.Series) -> dict[str, Any]:
     params = dict(RF_CONFIG_DEFAULTS.get(row["model_name"], {}))
     params.update(
         {
@@ -408,7 +442,42 @@ def make_rf_model(row: pd.Series) -> RandomForestClassifier:
             "n_jobs": -1,
         }
     )
-    return RandomForestClassifier(**params)
+    return params
+
+
+def selected_model_params(row: pd.Series) -> dict[str, Any]:
+    model_type = row["model_type"]
+    if model_type == "logistic_regression":
+        return logistic_model_params(row)
+    if model_type == "random_forest":
+        return rf_model_params(row)
+    raise ValueError(f"Unsupported model_type: {model_type}")
+
+
+def processing_export(processing_info: dict[str, Any]) -> dict[str, Any]:
+    method = processing_info.get("feature_method", "none")
+    processor = processing_info.get("processor")
+    export: dict[str, Any] = {"feature_method": method}
+
+    if method == "corr_cluster" and processor is not None:
+        export["selected_features"] = getattr(processor, "selected_features_", [])
+        cluster_summary = getattr(processor, "cluster_summary_", pd.DataFrame())
+        export["cluster_summary"] = (
+            cluster_summary.to_dict(orient="records")
+            if isinstance(cluster_summary, pd.DataFrame)
+            else []
+        )
+    elif method == "pca" and isinstance(processor, dict):
+        export["pca_input_features"] = processor.get("feature_columns", [])
+        export["pca_component_columns"] = processor.get("component_columns", [])
+        export["pca_clip_lower"] = processor.get("clip_lower", pd.Series(dtype=float)).to_dict()
+        export["pca_clip_upper"] = processor.get("clip_upper", pd.Series(dtype=float)).to_dict()
+        pca = processor.get("pca")
+        if pca is not None:
+            export["pca_n_components_fitted"] = int(getattr(pca, "n_components_", 0))
+            export["pca_explained_variance_ratio"] = getattr(pca, "explained_variance_ratio_", np.array([])).tolist()
+
+    return export
 
 
 def fit_selected_model(row: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
@@ -468,13 +537,53 @@ def fit_selected_model(row: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame, dict
     fit_metadata.update(
         {
             "train_rows": len(train_df),
+            "train_start_date": train_df[DATE_COL].min(),
+            "train_end_date": train_df[DATE_COL].max(),
             "original_feature_count": len(feature_cols),
             "processed_feature_count": len(processed_cols),
+            "original_feature_cols": feature_cols,
             "processed_cols": processed_cols,
             "processing_info": processing_info,
+            "processing_export": processing_export(processing_info),
         }
     )
     return importance_df, build_cluster_importance(importance_df, processing_info), fit_metadata
+
+
+def build_selected_model_run_config(row: pd.Series, metadata: dict[str, Any]) -> dict[str, Any]:
+    feature_params = parse_params(row.get("feature_params", {}))
+    processing_details = metadata.get("processing_export", {})
+
+    return {
+        "ticker": row["ticker"],
+        "model_type": row["model_type"],
+        "model_name": row["model_name"],
+        "model_params": json_dumps(selected_model_params(row)),
+        "tb_config_name": row["tb_config_name"],
+        "num_days": clean_scalar(row.get("num_days")),
+        "feature_method": row["feature_method"],
+        "feature_params": json_dumps(feature_params),
+        "selection_rule": row.get("selection_rule"),
+        "auc_rank_within_ticker": clean_scalar(row.get("auc_rank_within_ticker")),
+        "mean_auc": clean_scalar(row.get("mean_auc")),
+        "std_auc": clean_scalar(row.get("std_auc")),
+        "median_path_trade_sharpe": clean_scalar(row.get("median_path_trade_sharpe")),
+        "path_sharpe_iqr": clean_scalar(row.get("path_sharpe_iqr")),
+        "train_start_date": metadata["train_start_date"],
+        "train_end_date": metadata["train_end_date"],
+        "test_start_date": TEST_START_DATE,
+        "train_on_nonzero_signals_only": TRAIN_ON_NONZERO_SIGNALS_ONLY,
+        "target_col": TARGET_COL,
+        "date_col": DATE_COL,
+        "instrument_col": INSTRUMENT_COL,
+        "protected_features": json_dumps(PROTECTED_FEATURES),
+        "train_rows": metadata["train_rows"],
+        "original_feature_count": metadata["original_feature_count"],
+        "processed_feature_count": metadata["processed_feature_count"],
+        "original_feature_columns": json_dumps(metadata["original_feature_cols"]),
+        "processed_feature_columns": json_dumps(metadata["processed_cols"]),
+        "feature_processing_details": json_dumps(processing_details),
+    }
 
 
 def build_cluster_importance(feature_importance_df: pd.DataFrame, processing_info: dict[str, Any]) -> pd.DataFrame:
@@ -556,6 +665,7 @@ def main() -> None:
     comparison_path = results_dir / "model_comparison.csv"
     top3_path = results_dir / "feature_importance_top3_by_auc.csv"
     selected_path = results_dir / "feature_importance_selected_models.csv"
+    selected_run_config_path = results_dir / "selected_model_run_configs.csv"
     feature_path = results_dir / "feature_importance_feature_level.csv"
     cluster_path = results_dir / "feature_importance_cluster_level.csv"
 
@@ -565,12 +675,14 @@ def main() -> None:
     feature_tables = []
     cluster_tables = []
     fit_rows = []
+    run_config_rows = []
 
     for row in selected_df.itertuples(index=False):
         row_series = pd.Series(row._asdict())
         feature_df, cluster_df, metadata = fit_selected_model(row_series)
         feature_tables.append(feature_df)
         cluster_tables.append(cluster_df)
+        run_config_rows.append(build_selected_model_run_config(row_series, metadata))
         fit_rows.append(
             {
                 "ticker": row_series["ticker"],
@@ -586,12 +698,14 @@ def main() -> None:
 
     top3_df.to_csv(top3_path, index=False)
     selected_df.merge(pd.DataFrame(fit_rows), on=["ticker", "model_type", "tb_config_name", "model_name", "feature_method"], how="left").to_csv(selected_path, index=False)
+    pd.DataFrame(run_config_rows).to_csv(selected_run_config_path, index=False)
     pd.concat(feature_tables, ignore_index=True).to_csv(feature_path, index=False)
     pd.concat(cluster_tables, ignore_index=True).to_csv(cluster_path, index=False)
 
     print("Saved:")
     print(top3_path)
     print(selected_path)
+    print(selected_run_config_path)
     print(feature_path)
     print(cluster_path)
 

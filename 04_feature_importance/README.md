@@ -19,8 +19,14 @@ Outputs:
 
 - `results/feature_importance_top3_by_auc.csv`
 - `results/feature_importance_selected_models.csv`
+- `results/selected_model_run_configs.csv`
 - `results/feature_importance_feature_level.csv`
 - `results/feature_importance_cluster_level.csv`
+
+Use `results/selected_model_run_configs.csv` when running the selected models
+later on the test set. It contains one row per selected ticker model with the
+model parameters, triple-barrier config, feature-processing parameters, training
+window, selected feature columns, and fitted correlation-cluster/PCA metadata.
 
 Run the notebook:
 
