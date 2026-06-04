@@ -1,0 +1,3 @@
+ticker,barrier,feature_selection,model,mean_auc,median_auc,valid_auc_paths,median_sharpe,mean_sharpe,sharpe_iqr,sharpe_std,total_trades,avg_selected_features,avg_train_rows,avg_test_rows
+cl1s,ewma_d10_tp2.0_sl2.0,none,logistic,0.6177755019177602,0.61892177589852,15,2.129970026486926,1.9929575606525867,4.588455070539227,2.6238413319300316,805,188.0,196.8,108.0
+cl1s,ewma_d10_tp2.0_sl2.0,none,random_forest,0.5630468289011851,0.5571183533447684,15,2.247413405488597,2.4900774206934853,3.3984894764211506,2.5927798550259116,557,188.0,196.8,108.0
