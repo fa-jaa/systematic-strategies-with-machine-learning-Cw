@@ -81,3 +81,7 @@ dmypy.json
 data/**/*.csv
 !data/raw/
 !data/raw/*.csv
+
+# Keep curated result tables under version control
+!results/
+!results/*.csv
