@@ -3,14 +3,14 @@
 This is the advanced strategy route described in the optional session:
 
     features + primary_signal + metamodel_probability
-        -> neural conviction in [-1, 1]
+        -> neural conviction strength in [0, 1]
         -> volatility-targeted weight
         -> portfolio return path
-        -> train on negative Sharpe
+        -> train on penalized negative Sharpe with validation early stopping
 
 To keep the script dependency-light, the model is a small NumPy neural head:
 
-    conviction = tanh(x @ beta + ticker_bias)
+    conviction_strength = tanh(x @ beta + ticker_bias) ** 2
 
 It is not a full TFT/VSN implementation, but it implements the same portfolio
 training objective and inference mechanics from the slides. If the team later
@@ -32,8 +32,8 @@ STRATEGY_ROOT = Path(__file__).resolve().parent
 FEATURE_MATRIX_PATH = PROJECT_ROOT / "data" / "features" / "merged_feature_matrix.csv"
 OHLCV_PATH = PROJECT_ROOT / "data" / "raw" / "ohlcv_data.csv"
 PRIMARY_SIGNALS_PATH = PROJECT_ROOT / "data" / "raw" / "primary_signals.csv"
-DEFAULT_TRAIN_PROBABILITY_CSV = STRATEGY_ROOT / "probabilities" / "placeholder_energy_train_active_055.csv"
-DEFAULT_INFERENCE_PROBABILITY_CSV = STRATEGY_ROOT / "probabilities" / "placeholder_energy_active_055.csv"
+DEFAULT_INFERENCE_PROBABILITY_CSV = PROJECT_ROOT / "deliverables" / "final_predictions.csv"
+DEFAULT_TRAIN_PROBABILITY_CSV = PROJECT_ROOT / "deliverables" / "insample_predicitons" / "insample_predictions.csv"
 DEFAULT_OUTPUT_DIR = STRATEGY_ROOT / "outputs" / "neural_portfolio"
 
 ENERGY_TICKERS = ["cl1s", "ho1s", "rb1s", "ng1s"]
@@ -46,6 +46,7 @@ TARGET_VOL = 0.10
 EWMA_SPAN = 60
 MAX_ABS_WEIGHT = 0.25
 MAX_GROSS_EXPOSURE = 1.00
+PROBABILITY_THRESHOLD = 0.50
 ANNUALIZATION = np.sqrt(252.0)
 
 
@@ -61,13 +62,25 @@ class NeuralPortfolioState:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a Sharpe-optimized neural portfolio head.")
-    parser.add_argument("--train-probability-csv", type=Path, default=DEFAULT_TRAIN_PROBABILITY_CSV)
+    parser.add_argument(
+        "--train-probability-csv",
+        type=Path,
+        default=DEFAULT_TRAIN_PROBABILITY_CSV,
+        help=(
+            "Real pre-2022 out-of-fold/CPCV probabilities used to train the "
+            "Sharpe-optimized neural allocation head."
+        ),
+    )
     parser.add_argument("--inference-probability-csv", type=Path, default=DEFAULT_INFERENCE_PROBABILITY_CSV)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--epochs", type=int, default=400)
-    parser.add_argument("--learning-rate", type=float, default=0.03)
-    parser.add_argument("--l2", type=float, default=1e-4)
-    parser.add_argument("--max-features", type=int, default=80)
+    parser.add_argument("--epochs", type=int, default=800)
+    parser.add_argument("--learning-rate", type=float, default=0.02)
+    parser.add_argument("--l2", type=float, default=5e-4)
+    parser.add_argument("--max-features", type=int, default=20)
+    parser.add_argument("--validation-fraction", type=float, default=0.25)
+    parser.add_argument("--early-stopping-patience", type=int, default=75)
+    parser.add_argument("--exposure-penalty", type=float, default=0.10)
+    parser.add_argument("--turnover-penalty", type=float, default=0.02)
     parser.add_argument("--random-state", type=int, default=42)
     return parser.parse_args()
 
@@ -155,6 +168,9 @@ def build_dataset(probability_csv: Path, tickers: list[str]) -> pd.DataFrame:
         .reset_index(drop=True)
     )
     data["primary_signal"] = data["primary_signal"].fillna(0).astype(int)
+    data["probability_edge"] = data["prediction"] - PROBABILITY_THRESHOLD
+    data["probability_confidence"] = ((data["prediction"] - PROBABILITY_THRESHOLD) / (1.0 - PROBABILITY_THRESHOLD)).clip(0.0, 1.0)
+    data["probability_gate"] = (data["prediction"] > PROBABILITY_THRESHOLD).astype(float)
     data = data[data["instrument"].isin(tickers)].copy()
     data = data[data["annualized_ewma_vol"].notna() & (data["annualized_ewma_vol"] > 0)].copy()
     return data.reset_index(drop=True)
@@ -188,33 +204,113 @@ def apply_weight_caps(weights: np.ndarray, dates: np.ndarray) -> np.ndarray:
     return out
 
 
+def annualized_sharpe(pnl: np.ndarray) -> float:
+    """Annualized Sharpe for a row-level PnL vector."""
+
+    if len(pnl) < 2:
+        return np.nan
+    std = pnl.std(ddof=1)
+    if std == 0 or np.isnan(std):
+        return np.nan
+    return pnl.mean() / std * ANNUALIZATION
+
+
+def validation_sharpe(
+    data: pd.DataFrame,
+    feature_cols: list[str],
+    feature_mean: pd.Series,
+    feature_std: pd.Series,
+    instruments: list[str],
+    beta: np.ndarray,
+    ticker_bias: np.ndarray,
+) -> float:
+    """Evaluate validation Sharpe using the same capped execution layer."""
+
+    if data.empty:
+        return np.nan
+    ticker_to_idx = {ticker: i for i, ticker in enumerate(instruments)}
+    data = data[data["instrument"].isin(ticker_to_idx)].copy()
+    if data.empty:
+        return np.nan
+
+    x, _, _ = standardize_features(data, feature_cols, feature_mean, feature_std)
+    ticker_idx = data["instrument"].map(ticker_to_idx).values
+    side = data["primary_signal"].astype(float).values
+    gate = data["probability_gate"].astype(float).values
+    vol = data["annualized_ewma_vol"].astype(float).values
+    next_return = data["next_return"].astype(float).fillna(0.0).values
+
+    conviction = np.tanh(x @ beta + ticker_bias[ticker_idx])
+    strength = conviction**2
+    raw_weight = side * gate * strength * TARGET_VOL / vol
+    weight = apply_weight_caps(raw_weight, data["date"].values)
+    return annualized_sharpe(weight * next_return)
+
+
+def split_train_validation(train: pd.DataFrame, validation_fraction: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Use the last chronological block for validation to reduce regime leakage."""
+
+    dates = np.array(sorted(train["date"].unique()))
+    if len(dates) < 4:
+        return train.copy(), train.iloc[0:0].copy()
+    validation_count = max(1, int(np.ceil(len(dates) * validation_fraction)))
+    validation_dates = set(dates[-validation_count:])
+    fit = train[~train["date"].isin(validation_dates)].copy()
+    validation = train[train["date"].isin(validation_dates)].copy()
+    return fit.reset_index(drop=True), validation.reset_index(drop=True)
+
+
 def train_sharpe_head(train: pd.DataFrame, feature_cols: list[str], args: argparse.Namespace) -> NeuralPortfolioState:
-    """Train tanh projection parameters by gradient ascent on annualized Sharpe."""
+    """Train tanh projection parameters with validation early stopping."""
 
     rng = np.random.default_rng(args.random_state)
-    instruments = sorted(train["instrument"].unique().tolist())
+    fit, validation = split_train_validation(train, args.validation_fraction)
+    instruments = sorted(fit["instrument"].unique().tolist())
     ticker_to_idx = {ticker: i for i, ticker in enumerate(instruments)}
 
-    x, feature_mean, feature_std = standardize_features(train, feature_cols)
-    ticker_idx = train["instrument"].map(ticker_to_idx).values
-    side = train["primary_signal"].astype(float).values
-    vol = train["annualized_ewma_vol"].astype(float).values
-    next_return = train["next_return"].astype(float).fillna(0.0).values
+    x, feature_mean, feature_std = standardize_features(fit, feature_cols)
+    ticker_idx = fit["instrument"].map(ticker_to_idx).values
+    side = fit["primary_signal"].astype(float).values
+    gate = fit["probability_gate"].astype(float).values
+    vol = fit["annualized_ewma_vol"].astype(float).values
+    next_return = fit["next_return"].astype(float).fillna(0.0).values
+    dates = fit["date"].values
+    instrument_values = fit["instrument"].values
 
     beta = rng.normal(0.0, 0.02, size=x.shape[1])
     ticker_bias = np.zeros(len(instruments))
+    best_beta = beta.copy()
+    best_ticker_bias = ticker_bias.copy()
+    best_validation = -np.inf
+    stale_epochs = 0
 
     for epoch in range(1, args.epochs + 1):
         z = x @ beta + ticker_bias[ticker_idx]
         conviction = np.tanh(z)
-        raw_weight = side * conviction * TARGET_VOL / vol
-        weight = apply_weight_caps(raw_weight, train["date"].values)
+        strength = conviction**2
+        raw_weight = side * gate * strength * TARGET_VOL / vol
+        weight = apply_weight_caps(raw_weight, dates)
         pnl = weight * next_return
 
         mean = pnl.mean()
         centered = pnl - mean
         std = np.sqrt(np.mean(centered**2) + 1e-8)
         sharpe = mean / std * ANNUALIZATION
+        exposure_cost = args.exposure_penalty * np.mean(raw_weight**2)
+        turnover_cost = 0.0
+        turnover_grad_weight = np.zeros_like(raw_weight)
+        for instrument in pd.unique(instrument_values):
+            mask = instrument_values == instrument
+            idx = np.flatnonzero(mask)
+            if len(idx) < 2:
+                continue
+            diffs = np.diff(raw_weight[idx])
+            turnover_cost += args.turnover_penalty * np.mean(diffs**2)
+            local_grad = np.zeros(len(idx))
+            local_grad[:-1] += -2.0 * diffs / len(diffs)
+            local_grad[1:] += 2.0 * diffs / len(diffs)
+            turnover_grad_weight[idx] += args.turnover_penalty * local_grad
+        objective = sharpe - exposure_cost - turnover_cost
 
         # Gradient of Sharpe with respect to each return contribution. This is
         # full-batch training over the return path, as in the optional session.
@@ -224,8 +320,10 @@ def train_sharpe_head(train: pd.DataFrame, feature_cols: list[str], args: argpar
         # We do not backpropagate through the clipping/gross cap. This keeps the
         # optimizer simple and treats caps as the final execution layer.
         draw_weight_draw = (np.abs(raw_weight) <= MAX_ABS_WEIGHT).astype(float)
-        dweight_dz = side * TARGET_VOL / vol * (1.0 - conviction**2) * draw_weight_draw
-        dz_grad = dsharpe_dpnl * next_return * dweight_dz
+        dstrength_dz = 2.0 * conviction * (1.0 - conviction**2)
+        dweight_dz = side * gate * TARGET_VOL / vol * dstrength_dz * draw_weight_draw
+        penalty_grad_weight = (2.0 * args.exposure_penalty * raw_weight / len(raw_weight)) + turnover_grad_weight
+        dz_grad = (dsharpe_dpnl * next_return - penalty_grad_weight) * dweight_dz
 
         grad_beta = x.T @ dz_grad - args.l2 * beta
         grad_bias = np.bincount(ticker_idx, weights=dz_grad, minlength=len(instruments)) - args.l2 * ticker_bias
@@ -233,10 +331,29 @@ def train_sharpe_head(train: pd.DataFrame, feature_cols: list[str], args: argpar
         beta += args.learning_rate * grad_beta
         ticker_bias += args.learning_rate * grad_bias
 
-        if epoch == 1 or epoch % 100 == 0 or epoch == args.epochs:
-            print(f"epoch {epoch:4d} | train sharpe {sharpe: .4f} | mean daily pnl {mean: .6f}")
+        val_sharpe = validation_sharpe(validation, feature_cols, feature_mean, feature_std, instruments, beta, ticker_bias)
+        if np.isnan(val_sharpe):
+            val_sharpe = sharpe
 
-    return NeuralPortfolioState(feature_cols, instruments, feature_mean, feature_std, beta, ticker_bias)
+        if val_sharpe > best_validation + 1e-5:
+            best_validation = val_sharpe
+            best_beta = beta.copy()
+            best_ticker_bias = ticker_bias.copy()
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+
+        if epoch == 1 or epoch % 100 == 0 or epoch == args.epochs:
+            print(
+                f"epoch {epoch:4d} | objective {objective: .4f} | "
+                f"fit sharpe {sharpe: .4f} | validation sharpe {val_sharpe: .4f}"
+            )
+
+        if stale_epochs >= args.early_stopping_patience:
+            print(f"early stopping at epoch {epoch}; best validation sharpe {best_validation: .4f}")
+            break
+
+    return NeuralPortfolioState(feature_cols, instruments, feature_mean, feature_std, best_beta, best_ticker_bias)
 
 
 def infer_weights(data: pd.DataFrame, state: NeuralPortfolioState) -> pd.DataFrame:
@@ -247,15 +364,19 @@ def infer_weights(data: pd.DataFrame, state: NeuralPortfolioState) -> pd.DataFra
     x, _, _ = standardize_features(data, state.feature_cols, state.feature_mean, state.feature_std)
     ticker_idx = data["instrument"].map(ticker_to_idx).values
     side = data["primary_signal"].astype(float).values
+    gate = data["probability_gate"].astype(float).values
     vol = data["annualized_ewma_vol"].astype(float).values
 
     z = x @ state.beta + state.ticker_bias[ticker_idx]
     conviction = np.tanh(z)
-    raw_weight = side * conviction * TARGET_VOL / vol
+    strength = conviction**2
+    raw_weight = side * gate * strength * TARGET_VOL / vol
     weight = apply_weight_caps(raw_weight, data["date"].values)
 
     out = data[["date", "instrument", "prediction", "primary_signal", "annualized_ewma_vol"]].copy()
     out["neural_conviction"] = conviction
+    out["neural_strength"] = strength
+    out["probability_gate"] = gate
     out["raw_weight"] = raw_weight
     out["weight"] = weight
     return out

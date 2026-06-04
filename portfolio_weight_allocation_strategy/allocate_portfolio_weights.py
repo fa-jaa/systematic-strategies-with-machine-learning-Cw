@@ -5,10 +5,10 @@ This implements a simple PDF-aligned strategy:
 1. primary_signal supplies direction in {-1, 0, +1}
 2. metamodel probability supplies confidence/sizing
 3. EWMA volatility targeting converts confidence into risk-scaled weights
-4. per-instrument and gross-exposure caps keep the placeholder strategy bounded
+4. per-instrument and gross-exposure caps keep the strategy bounded
 
-The default input is a placeholder probability CSV. Replace it with cleaned
-model probabilities once they are available.
+The default input is `deliverables/final_predictions.csv`, the cleaned
+metamodel probability file.
 
 The script deliberately does not train a model. It is an inference/allocation
 layer: once a metamodel has produced probabilities, this file converts them into
@@ -27,7 +27,7 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STRATEGY_ROOT = Path(__file__).resolve().parent
-DEFAULT_PROBABILITY_CSV = STRATEGY_ROOT / "probabilities" / "placeholder_energy_active_055.csv"
+DEFAULT_PROBABILITY_CSV = PROJECT_ROOT / "deliverables" / "final_predictions.csv"
 PRIMARY_SIGNALS_PATH = PROJECT_ROOT / "data" / "raw" / "primary_signals.csv"
 OHLCV_PATH = PROJECT_ROOT / "data" / "raw" / "ohlcv_data.csv"
 DEFAULT_OUTPUT_DIR = STRATEGY_ROOT / "outputs"

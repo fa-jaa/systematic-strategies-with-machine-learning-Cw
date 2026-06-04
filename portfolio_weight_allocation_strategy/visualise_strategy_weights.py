@@ -120,6 +120,11 @@ def strategy_summary(comparison: pd.DataFrame) -> pd.DataFrame:
 def instrument_summary(comparison: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for instrument, group in comparison.groupby("instrument"):
+        if group["fixed_weight"].nunique() > 1 and group["neural_weight"].nunique() > 1:
+            weight_correlation = group["fixed_weight"].corr(group["neural_weight"])
+        else:
+            weight_correlation = np.nan
+
         rows.append(
             {
                 "instrument": instrument,
@@ -131,7 +136,7 @@ def instrument_summary(comparison: pd.DataFrame) -> pd.DataFrame:
                 "mean_weight_diff": group["weight_diff"].mean(),
                 "mean_abs_weight_diff": group["weight_diff"].abs().mean(),
                 "same_sign_rate": group["same_sign"].mean(),
-                "weight_correlation": group["fixed_weight"].corr(group["neural_weight"]),
+                "weight_correlation": weight_correlation,
             }
         )
     return pd.DataFrame(rows)
@@ -219,6 +224,25 @@ def plot_instrument_bars(summary: pd.DataFrame, output_dir: Path) -> None:
     plt.close(fig)
 
 
+def plot_sharpe_summary(summary: pd.DataFrame, output_dir: Path) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5))
+    colors = ["#2f6f9f" if value >= 0 else "#b34d4d" for value in summary["annualized_sharpe"]]
+    ax.bar(summary["strategy"], summary["annualized_sharpe"], color=colors)
+    ax.axhline(0, color="black", linewidth=1)
+    ax.set_title("Annualized Sharpe by Strategy")
+    ax.set_ylabel("Sharpe")
+    ax.grid(axis="y", alpha=0.3)
+
+    for idx, value in enumerate(summary["annualized_sharpe"]):
+        va = "bottom" if value >= 0 else "top"
+        offset = 0.08 if value >= 0 else -0.08
+        ax.text(idx, value + offset, f"{value:.2f}", ha="center", va=va)
+
+    fig.tight_layout()
+    fig.savefig(output_dir / "annualized_sharpe_by_strategy.png", dpi=150)
+    plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -237,6 +261,7 @@ def main() -> None:
     plot_cumulative_pnl(daily, args.output_dir)
     plot_weight_scatter(comparison, args.output_dir)
     plot_instrument_bars(by_instrument, args.output_dir)
+    plot_sharpe_summary(summary, args.output_dir)
 
     print("Comparison rows:", len(comparison))
     print("Saved comparison outputs to:", args.output_dir)

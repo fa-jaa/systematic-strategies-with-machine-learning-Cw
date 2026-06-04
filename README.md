@@ -148,20 +148,20 @@ Use this for explanation, plots, and comparison with the scripted run. The enhan
 
 ### 7. Final Prediction CSV
 
-This step is still missing. The final code should load the selected configs/models and produce:
+The final metamodel probability file is:
 
 ```text
-data/submission/metamodel_predictions.csv
+deliverables/final_predictions.csv
 ```
 
-with:
+Format:
 
 ```csv
 date,instrument,prediction
-2022-01-03,cl1s,0.74
+2022-01-03,cl1s,0.9576887296513032
 ```
 
-The final prediction period should be January-June 2022. Do not train on labels from this period.
+This file is used as the inference input for portfolio-weight generation.
 
 ### 8. Optional Portfolio Weights
 
@@ -171,13 +171,7 @@ The portfolio-weight allocation strategy lives in:
 portfolio_weight_allocation_strategy/
 ```
 
-Generate temporary probability inputs:
-
-```powershell
-python portfolio_weight_allocation_strategy\generate_placeholder_probabilities.py
-```
-
-Generate weights from the default Energy placeholder:
+Generate fixed-strategy weights from `deliverables/final_predictions.csv`:
 
 ```powershell
 python portfolio_weight_allocation_strategy\allocate_portfolio_weights.py
@@ -186,15 +180,33 @@ python portfolio_weight_allocation_strategy\allocate_portfolio_weights.py
 Expected outputs:
 
 ```text
-portfolio_weight_allocation_strategy/probabilities/*.csv
 portfolio_weight_allocation_strategy/outputs/strategy_weights.csv
 portfolio_weight_allocation_strategy/outputs/allocation_diagnostics.csv
 ```
 
-When cleaned metamodel probabilities are ready, pass them in with:
+Generate the neural strategy from real pre-2022 in-sample probabilities and
+`deliverables/final_predictions.csv`:
 
 ```powershell
-python portfolio_weight_allocation_strategy\allocate_portfolio_weights.py --probability-csv path\to\clean_probabilities.csv
+python portfolio_weight_allocation_strategy\neural_portfolio_allocator.py
+```
+
+Compare fixed vs neural and rebuild the plots/notebook inputs:
+
+```powershell
+python portfolio_weight_allocation_strategy\visualise_strategy_weights.py --fixed-weights deliverables\portfolio_weight_outputs\fixed_strategy\strategy_weights.csv --neural-weights deliverables\portfolio_weight_outputs\neural_strategy\neural_strategy_weights.csv --output-dir deliverables\portfolio_weight_outputs\strategy_comparison
+```
+
+Grouped portfolio outputs live under:
+
+```text
+deliverables/portfolio_weight_outputs/
+```
+
+The comparison notebook is:
+
+```text
+deliverables/portfolio_weight_outputs/strategy_comparison/strategy_comparison_explained.ipynb
 ```
 
 ## Notes
