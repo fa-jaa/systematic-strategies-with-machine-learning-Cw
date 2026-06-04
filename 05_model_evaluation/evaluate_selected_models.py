@@ -2,8 +2,8 @@
 
 The script reads the selected model run configurations produced by
 04_feature_importance/cluster_feature_importance.py, retrains each selected
-model on pre-test data, scores the 2022+ labelled events, and writes the final
-deliverable CSV:
+model on pre-test data, scores both the in-sample training events and the
+2022+ labelled events, and writes deliverable CSVs:
 
     date,instrument,prediction
 """
@@ -48,6 +48,7 @@ import cluster_feature_importance as cfi  # noqa: E402
 
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "results" / "selected_model_run_configs.csv"
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "deliverables" / "final_predictions.csv"
+DEFAULT_INSAMPLE_OUTPUT_PATH = PROJECT_ROOT / "deliverables" / "insample_predicitons" / "insample_predictions.csv"
 
 
 def parse_json(value: Any, default: Any) -> Any:
@@ -150,14 +151,39 @@ def make_model(model_type: str, model_params: dict[str, Any]) -> LogisticRegress
     raise ValueError(f"Unsupported model_type for evaluation: {model_type}")
 
 
-def fit_predict_detailed_config(config: pd.Series) -> pd.DataFrame:
+def build_prediction_frame(
+    data: pd.DataFrame,
+    y_proba: np.ndarray,
+    config: pd.Series,
+    tb_config_name: str,
+) -> pd.DataFrame:
+    detailed = pd.DataFrame(
+        {
+            "date": data[cfi.DATE_COL].dt.strftime("%Y-%m-%d"),
+            "instrument": data[cfi.INSTRUMENT_COL].str.lower(),
+            "prediction": y_proba,
+            "predicted_label": (y_proba >= 0.5).astype(int),
+            "model_type": config["model_type"],
+            "model_name": config["model_name"],
+            "tb_config_name": tb_config_name,
+            "feature_method": config["feature_method"],
+        }
+    )
+    if cfi.TARGET_COL in data.columns:
+        detailed["y_true"] = data[cfi.TARGET_COL].astype(int).to_numpy()
+    if "primary_signal" in data.columns:
+        detailed["primary_signal"] = data["primary_signal"].to_numpy()
+    if "signed_touch_return" in data.columns:
+        detailed["signed_touch_return"] = data["signed_touch_return"].to_numpy()
+    return detailed
+
+
+def fit_model_bundle(config: pd.Series) -> dict[str, Any]:
     ticker = config["ticker"]
     tb_config_name = config["tb_config_name"]
     feature_cols = parse_json(config["original_feature_columns"], default=[])
     feature_params = parse_json(config["feature_params"], default={})
     model_params = parse_json(config["model_params"], default={})
-    test_start_date = config.get("test_start_date", cfi.TEST_START_DATE)
-    train_on_nonzero = bool(config.get("train_on_nonzero_signals_only", True))
 
     train_df, discovered_feature_cols = cfi.build_training_data(ticker, tb_config_name)
     if not feature_cols:
@@ -176,49 +202,78 @@ def fit_predict_detailed_config(config: pd.Series) -> pd.DataFrame:
         feature_params=feature_params,
     )
 
-    test_df = build_test_data(
-        ticker=ticker,
-        tb_config_name=tb_config_name,
-        feature_cols=feature_cols,
-        test_start_date=test_start_date,
-        train_on_nonzero_signals_only=train_on_nonzero,
-    )
-    X_test = transform_features(test_df, feature_cols, processing_info)
-
     model = make_model(config["model_type"], model_params)
     if config["model_type"] == "logistic_regression":
         imputer = SimpleImputer(strategy="median")
         scaler = StandardScaler()
         X_train_fit = scaler.fit_transform(imputer.fit_transform(X_train))
-        X_test_fit = scaler.transform(imputer.transform(X_test))
     else:
+        imputer = None
+        scaler = None
         X_train_fit = X_train
-        X_test_fit = X_test
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         model.fit(X_train_fit, y_train)
-        y_proba = model.predict_proba(X_test_fit)[:, 1]
 
-    detailed = pd.DataFrame(
-        {
-            "date": test_df[cfi.DATE_COL].dt.strftime("%Y-%m-%d"),
-            "instrument": test_df[cfi.INSTRUMENT_COL].str.lower(),
-            "prediction": y_proba,
-            "predicted_label": (y_proba >= 0.5).astype(int),
-            "model_type": config["model_type"],
-            "model_name": config["model_name"],
-            "tb_config_name": tb_config_name,
-            "feature_method": config["feature_method"],
-        }
+    return {
+        "ticker": ticker,
+        "tb_config_name": tb_config_name,
+        "feature_cols": feature_cols,
+        "train_df": train_df,
+        "X_train_fit": X_train_fit,
+        "model": model,
+        "imputer": imputer,
+        "scaler": scaler,
+        "processing_info": processing_info,
+    }
+
+
+def apply_model_preprocessing(bundle: dict[str, Any], X: pd.DataFrame) -> pd.DataFrame | np.ndarray:
+    if bundle["imputer"] is None:
+        return X
+    return bundle["scaler"].transform(bundle["imputer"].transform(X))
+
+
+def fit_predict_detailed_config(config: pd.Series) -> pd.DataFrame:
+    test_start_date = config.get("test_start_date", cfi.TEST_START_DATE)
+    train_on_nonzero = bool(config.get("train_on_nonzero_signals_only", True))
+    bundle = fit_model_bundle(config)
+
+    test_df = build_test_data(
+        ticker=bundle["ticker"],
+        tb_config_name=bundle["tb_config_name"],
+        feature_cols=bundle["feature_cols"],
+        test_start_date=test_start_date,
+        train_on_nonzero_signals_only=train_on_nonzero,
     )
-    if cfi.TARGET_COL in test_df.columns:
-        detailed["y_true"] = test_df[cfi.TARGET_COL].astype(int).to_numpy()
-    if "primary_signal" in test_df.columns:
-        detailed["primary_signal"] = test_df["primary_signal"].to_numpy()
-    if "signed_touch_return" in test_df.columns:
-        detailed["signed_touch_return"] = test_df["signed_touch_return"].to_numpy()
-    return detailed
+    X_test = transform_features(test_df, bundle["feature_cols"], bundle["processing_info"])
+    X_test_fit = apply_model_preprocessing(bundle, X_test)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        y_proba = bundle["model"].predict_proba(X_test_fit)[:, 1]
+    return build_prediction_frame(test_df, y_proba, config, bundle["tb_config_name"])
+
+
+def fit_predict_insample_detailed_config(config: pd.Series) -> pd.DataFrame:
+    bundle = fit_model_bundle(config)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        y_proba = bundle["model"].predict_proba(bundle["X_train_fit"])[:, 1]
+    return build_prediction_frame(
+        bundle["train_df"],
+        y_proba,
+        config,
+        bundle["tb_config_name"],
+    )
+
+
+def final_prediction_columns(predictions: pd.DataFrame) -> pd.DataFrame:
+    return (
+        predictions[["date", "instrument", "prediction"]]
+        .sort_values(["date", "instrument"])
+        .reset_index(drop=True)
+    )
 
 
 def fit_and_predict_config(config: pd.Series) -> pd.DataFrame:
@@ -226,7 +281,16 @@ def fit_and_predict_config(config: pd.Series) -> pd.DataFrame:
     return detailed[["date", "instrument", "prediction"]].copy()
 
 
-def run_evaluation(config_path: Path, output_path: Path) -> pd.DataFrame:
+def fit_and_predict_insample_config(config: pd.Series) -> pd.DataFrame:
+    detailed = fit_predict_insample_detailed_config(config)
+    return detailed[["date", "instrument", "prediction"]].copy()
+
+
+def run_evaluation(
+    config_path: Path,
+    output_path: Path,
+    insample_output_path: Path | None = DEFAULT_INSAMPLE_OUTPUT_PATH,
+) -> pd.DataFrame:
     if not config_path.exists():
         raise FileNotFoundError(config_path)
 
@@ -235,24 +299,28 @@ def run_evaluation(config_path: Path, output_path: Path) -> pd.DataFrame:
         raise ValueError(f"No selected model configs found in {config_path}.")
 
     prediction_tables = []
+    insample_prediction_tables = []
     for config in configs.itertuples(index=False):
         config_series = pd.Series(config._asdict())
         predictions = fit_and_predict_config(config_series)
+        insample_predictions = fit_and_predict_insample_config(config_series)
         prediction_tables.append(predictions)
+        insample_prediction_tables.append(insample_predictions)
         print(
-            f"{config_series['ticker']}: wrote {len(predictions)} predictions "
-            f"from {predictions['date'].min()} to {predictions['date'].max()}"
+            f"{config_series['ticker']}: wrote {len(predictions)} test predictions "
+            f"from {predictions['date'].min()} to {predictions['date'].max()} "
+            f"and {len(insample_predictions)} in-sample predictions "
+            f"from {insample_predictions['date'].min()} to {insample_predictions['date'].max()}"
         )
 
-    final_predictions = (
-        pd.concat(prediction_tables, ignore_index=True)
-        .sort_values(["date", "instrument"])
-        .reset_index(drop=True)
-    )
-    final_predictions = final_predictions[["date", "instrument", "prediction"]]
-
+    final_predictions = final_prediction_columns(pd.concat(prediction_tables, ignore_index=True))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     final_predictions.to_csv(output_path, index=False)
+
+    if insample_output_path is not None:
+        insample_predictions = final_prediction_columns(pd.concat(insample_prediction_tables, ignore_index=True))
+        insample_output_path.parent.mkdir(parents=True, exist_ok=True)
+        insample_predictions.to_csv(insample_output_path, index=False)
     return final_predictions
 
 
@@ -270,13 +338,25 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_PATH,
         help="Path for the final date,instrument,prediction deliverable CSV.",
     )
+    parser.add_argument(
+        "--insample-output-path",
+        type=Path,
+        default=DEFAULT_INSAMPLE_OUTPUT_PATH,
+        help="Path for the in-sample date,instrument,prediction CSV.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    final_predictions = run_evaluation(args.config_path, args.output_path)
+    final_predictions = run_evaluation(
+        args.config_path,
+        args.output_path,
+        args.insample_output_path,
+    )
     print(f"Saved {len(final_predictions)} final predictions to: {args.output_path}")
+    if args.insample_output_path is not None:
+        print(f"Saved in-sample predictions to: {args.insample_output_path}")
 
 
 if __name__ == "__main__":

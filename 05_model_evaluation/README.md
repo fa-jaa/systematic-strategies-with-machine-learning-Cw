@@ -13,8 +13,9 @@ Input:
 Default output:
 
 - `deliverables/final_predictions.csv`
+- `deliverables/insample_predicitons/insample_predictions.csv`
 
-The deliverable CSV contains only:
+Both deliverable CSVs contain only:
 
 - `date`
 - `instrument`
