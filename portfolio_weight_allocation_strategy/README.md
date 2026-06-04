@@ -5,9 +5,15 @@ It does not train the metamodel. It assumes a metamodel has already produced a
 CSV of probabilities and converts those probabilities into signed portfolio
 weights.
 
-The design is intentionally simple and defensible: primary signals provide trade
-direction, metamodel probabilities provide conviction, and EWMA volatility
-targeting turns conviction into risk-scaled weights.
+There are two allocation routes:
+
+1. `allocate_portfolio_weights.py` - fixed probability sizing plus volatility targeting.
+2. `neural_portfolio_allocator.py` - neural Sharpe-optimized portfolio construction.
+
+The fixed route is the safest deliverable-ready strategy. The neural route is
+the advanced optional-session idea: feed features, primary side, and metamodel
+probability into a neural head, output a conviction, volatility-target it, and
+train by maximizing Sharpe.
 
 ## Inputs
 
@@ -31,6 +37,15 @@ The probability file can be sparse: it may contain only rows where the primary
 model has an active signal. This matches the current placeholder files and the
 format expected from cleaned model outputs.
 
+The neural route needs two probability files:
+
+```text
+training probabilities:  pre-2022 out-of-fold/CPCV probabilities
+inference probabilities: Jan-Jun 2022 probabilities for weight generation
+```
+
+For now, placeholders are generated for both.
+
 ## PDF Guidance Used
 
 From `Systematic_CW.pdf`:
@@ -53,7 +68,7 @@ Lecture 4 and Lecture 7 support the neural-network modelling side, especially
 VSN/TFT ideas. This folder implements the simpler fixed allocation route so the
 strategy can run immediately once probabilities are available.
 
-## Strategy Overview
+## Strategy 1: Fixed Probability Sizing
 
 For each active metamodel probability row, the script builds:
 
@@ -176,6 +191,7 @@ The first command creates temporary probability CSVs:
 portfolio_weight_allocation_strategy/probabilities/placeholder_energy_active_055.csv
 portfolio_weight_allocation_strategy/probabilities/placeholder_energy_neutral_050.csv
 portfolio_weight_allocation_strategy/probabilities/placeholder_all_assets_active_055.csv
+portfolio_weight_allocation_strategy/probabilities/placeholder_energy_train_active_055.csv
 ```
 
 The second command creates:
@@ -183,6 +199,84 @@ The second command creates:
 ```text
 portfolio_weight_allocation_strategy/outputs/strategy_weights.csv
 portfolio_weight_allocation_strategy/outputs/allocation_diagnostics.csv
+```
+
+## Strategy 2: Neural Sharpe-Optimized Portfolio
+
+This implements the advanced portfolio construction idea from the optional
+session in a dependency-light way. The model is a small differentiable neural
+head:
+
+```text
+conviction = tanh(features @ beta + ticker_bias)
+```
+
+The input feature vector includes:
+
+```text
+technical/statistical features
+primary_signal
+metamodel probability
+```
+
+The neural output is a signed conviction in `[-1, 1]`. This replaces the fixed
+probability-size rule.
+
+The weight is still volatility-targeted:
+
+```text
+raw_weight = neural_conviction * target_vol / annualized_ewma_vol
+```
+
+The model is trained directly on the portfolio return path:
+
+```text
+portfolio_return_t = mean_i(weight_t,i * next_return_t+1,i)
+loss = -annualized_sharpe(portfolio_return)
+```
+
+This follows the optional-session recipe:
+
+```text
+features + primary side + meta probability
+    -> neural conviction
+    -> volatility-targeted weights
+    -> portfolio returns
+    -> maximize Sharpe
+```
+
+### Why This Is Not a Full TFT/VSN
+
+The local environment currently does not have `torch` available, so this script
+uses a NumPy neural projection head rather than a full TFT/VSN sequence model.
+It still implements the core portfolio objective from the slides: train weights
+end-to-end by maximizing Sharpe.
+
+This is a good baseline. A later TFT/VSN version can replace only the
+`conviction = tanh(...)` head while keeping the same volatility targeting and
+Sharpe objective.
+
+### Run Neural Route
+
+Default run:
+
+```powershell
+python portfolio_weight_allocation_strategy\neural_portfolio_allocator.py
+```
+
+With real probabilities:
+
+```powershell
+python portfolio_weight_allocation_strategy\neural_portfolio_allocator.py --train-probability-csv path\to\pre2022_oof_probabilities.csv --inference-probability-csv path\to\jan_jun_2022_probabilities.csv
+```
+
+Outputs:
+
+```text
+portfolio_weight_allocation_strategy/outputs/neural_portfolio/neural_strategy_weights.csv
+portfolio_weight_allocation_strategy/outputs/neural_portfolio/neural_allocation_diagnostics.csv
+portfolio_weight_allocation_strategy/outputs/neural_portfolio/neural_feature_weights.csv
+portfolio_weight_allocation_strategy/outputs/neural_portfolio/neural_ticker_bias.csv
 ```
 
 ## Replacing Placeholder Probabilities
@@ -199,6 +293,11 @@ The cleaned probability file should have:
 date,instrument,prediction
 2022-01-03,cl1s,0.74
 ```
+
+For the neural route, the training probability file should contain pre-2022
+out-of-fold/CPCV probabilities. Do not train the neural allocator on Jan-Jun
+2022 probabilities if you are using that period as a clean evaluation/submission
+period.
 
 ## Outputs
 
@@ -239,7 +338,7 @@ Use this file to explain how probabilities became weights.
 
 ## Suggested Report Framing
 
-In the report, describe the strategy as:
+For the fixed strategy, describe it as:
 
 ```text
 We use the metamodel as a probability-based sizing layer on top of the primary
@@ -247,6 +346,17 @@ signal. The primary signal determines direction, while the metamodel probability
 determines conviction. Conviction is converted into a signed position using
 causal EWMA volatility targeting with a 10% annualized target volatility. We cap
 single-instrument weights at 25% and gross exposure at 100%.
+```
+
+For the neural strategy, describe it as:
+
+```text
+We also implement a neural portfolio-construction baseline inspired by the
+optional session. The model takes engineered features, the primary side, and the
+metamodel probability, maps them through a tanh projection to a signed conviction
+in [-1, 1], converts conviction into volatility-targeted weights, and trains the
+projection parameters by maximizing the annualized Sharpe ratio of the resulting
+portfolio return path.
 ```
 
 Metrics to report:
@@ -264,3 +374,6 @@ Metrics to report:
 The placeholder probabilities are not model outputs. They exist only so the
 allocation pipeline can be tested before cleaned probabilities arrive.
 
+The neural route is especially sensitive to placeholder probabilities. Treat any
+output generated from placeholders as a code-path check, not as evidence of
+final strategy quality.
