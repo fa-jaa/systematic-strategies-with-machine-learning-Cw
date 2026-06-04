@@ -5,9 +5,14 @@ available. They follow the coursework format:
 
     date,instrument,prediction
 
-The active placeholder sets active primary signals to 0.55 so the allocation
-pipeline produces non-zero smoke-test weights. Inactive primary signals are set
-to 0.0 because there is no primary trade to take.
+The placeholders keep only active primary-signal rows, matching the expected
+model-output shape where a probability is produced for a trade candidate:
+
+    date,instrument,prediction
+    2022-01-03,cl1s,0.55
+    2022-01-03,rb1s,0.55
+
+Inactive primary signals are omitted because there is no primary trade to size.
 """
 
 from __future__ import annotations
@@ -35,10 +40,8 @@ def make_long_signals() -> pd.DataFrame:
 
 
 def write_placeholder(df: pd.DataFrame, output_name: str, active_probability: float) -> Path:
-    out = df[["date", "instrument", "primary_signal"]].copy()
-    out["prediction"] = 0.0
-    active = out["primary_signal"].isin([-1, 1])
-    out.loc[active, "prediction"] = active_probability
+    out = df.loc[df["primary_signal"].isin([-1, 1]), ["date", "instrument"]].copy()
+    out["prediction"] = active_probability
     out = out[["date", "instrument", "prediction"]]
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -64,4 +67,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -9,6 +9,10 @@ This implements a simple PDF-aligned strategy:
 
 The default input is a placeholder probability CSV. Replace it with cleaned
 model probabilities once they are available.
+
+The script deliberately does not train a model. It is an inference/allocation
+layer: once a metamodel has produced probabilities, this file converts them into
+signed portfolio weights.
 """
 
 from __future__ import annotations
@@ -40,6 +44,13 @@ MAX_GROSS_EXPOSURE = 1.00
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse only operational arguments.
+
+    Risk constraints are hard-coded above so the strategy remains stable across
+    runs. The command line is reserved for swapping input probabilities, output
+    location, date window, and sizing family.
+    """
+
     parser = argparse.ArgumentParser(description="Generate signed strategy weights from probability CSV.")
     parser.add_argument("--probability-csv", type=Path, default=DEFAULT_PROBABILITY_CSV)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -50,17 +61,36 @@ def parse_args() -> argparse.Namespace:
 
 
 def normal_cdf(x: float) -> float:
+    """Standard normal CDF using only the Python standard library."""
+
     return 0.5 * (1.0 + erf(x / sqrt(2.0)))
 
 
 def probability_size(probability: float, method: str, threshold: float) -> float:
+    """Map a metamodel probability to an unsigned position size in [0, 1].
+
+    The primary model supplies direction separately. This function only decides
+    how much conviction to attach to an active primary signal.
+    """
+
     p = float(np.clip(probability, 0.0, 1.0))
+
+    # Probabilities at or below 0.5 imply the primary signal is not expected to
+    # be profitable, so the strategy sits out.
     if p <= threshold:
         return 0.0
+
+    # Binary gate: all accepted trades get the same full conviction.
     if method == "all_or_nothing":
         return 1.0
+
+    # Model-confidence sizing from the optional session: size equals the
+    # calibrated probability itself.
     if method == "model_confidence":
         return p
+
+    # NCDF sizing rewards high probabilities more aggressively while still
+    # returning a smooth monotone size in [0, 1].
     if method == "ncdf":
         denom = sqrt(max(p * (1.0 - p), 1e-12))
         return normal_cdf((p - 0.5) / denom)
@@ -68,6 +98,8 @@ def probability_size(probability: float, method: str, threshold: float) -> float
 
 
 def load_primary_signals(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+    """Load primary signals and reshape from wide CSV to long date/instrument rows."""
+
     signals = pd.read_csv(PRIMARY_SIGNALS_PATH, parse_dates=["date"])
     signals.columns = [col.lower() for col in signals.columns]
     signals = signals[(signals["date"] >= start_date) & (signals["date"] <= end_date)].copy()
@@ -77,6 +109,15 @@ def load_primary_signals(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd
 
 
 def load_probabilities(path: Path, start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+    """Load metamodel probabilities in coursework format.
+
+    Expected columns:
+        date,instrument,prediction
+
+    The probability file may contain only active trade rows. The downstream join
+    keeps that sparse shape, which matches the expected model output format.
+    """
+
     probabilities = pd.read_csv(path, parse_dates=["date"])
     required = {"date", "instrument", "prediction"}
     missing = required - set(probabilities.columns)
@@ -88,6 +129,12 @@ def load_probabilities(path: Path, start_date: pd.Timestamp, end_date: pd.Timest
 
 
 def load_annualized_ewma_vol(span: int) -> pd.DataFrame:
+    """Compute causal annualized EWMA volatility from daily close returns.
+
+    This is ex-ante for a weight dated t: it uses returns observed up to t and
+    never uses the next-day return that will realize after the position is set.
+    """
+
     ohlcv = pd.read_csv(OHLCV_PATH, parse_dates=["date"])
     ohlcv["instrument"] = ohlcv["instrument"].str.lower()
     ohlcv = ohlcv.sort_values(["instrument", "date"]).copy()
@@ -100,10 +147,14 @@ def load_annualized_ewma_vol(span: int) -> pd.DataFrame:
 
 
 def allocate(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Convert probabilities into signed volatility-targeted weights."""
+
     probabilities = load_probabilities(args.probability_csv, args.start_date, args.end_date)
     primary = load_primary_signals(args.start_date, args.end_date)
     vol = load_annualized_ewma_vol(EWMA_SPAN)
 
+    # Combine the three ingredients needed at each date/instrument:
+    # prediction = confidence, primary_signal = direction, vol = risk scaling.
     data = (
         probabilities.merge(primary, on=["date", "instrument"], how="left", validate="one_to_one")
         .merge(vol, on=["date", "instrument"], how="left", validate="many_to_one")
@@ -111,9 +162,16 @@ def allocate(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
         .reset_index(drop=True)
     )
     data["primary_signal"] = data["primary_signal"].fillna(0).astype(int)
+
+    # Probability sizing produces an unsigned conviction. Direction is applied
+    # later using the primary signal.
     data["size"] = data["prediction"].map(lambda p: probability_size(p, args.sizing_method, PROBABILITY_THRESHOLD))
     active = data["primary_signal"].isin([-1, 1]) & data["annualized_ewma_vol"].notna() & (data["annualized_ewma_vol"] > 0)
 
+    # Volatility targeting:
+    #   weight = direction * conviction * target_vol / ex_ante_vol
+    # This scales down high-vol instruments and scales up low-vol instruments so
+    # an equal conviction carries roughly comparable risk.
     data["raw_weight"] = 0.0
     data.loc[active, "raw_weight"] = (
         data.loc[active, "primary_signal"]
@@ -121,12 +179,19 @@ def allocate(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
         * TARGET_VOL
         / data.loc[active, "annualized_ewma_vol"]
     )
+
+    # Per-instrument cap keeps any single market from dominating the portfolio.
     data["capped_weight"] = data["raw_weight"].clip(-MAX_ABS_WEIGHT, MAX_ABS_WEIGHT)
 
+    # Gross-exposure cap is applied cross-sectionally each day. If the sum of
+    # absolute weights is too high, every position that day is scaled down by the
+    # same factor, preserving relative conviction and direction.
     gross = data.groupby("date")["capped_weight"].transform(lambda x: x.abs().sum())
     scale = np.where(gross > MAX_GROSS_EXPOSURE, MAX_GROSS_EXPOSURE / gross.replace(0, np.nan), 1.0)
     data["weight"] = data["capped_weight"] * pd.Series(scale, index=data.index).fillna(1.0)
 
+    # The coursework weight deliverable needs only date/instrument/weight.
+    # Diagnostics keep the intermediate columns for debugging and reporting.
     weights = data[["date", "instrument", "weight"]].copy()
     diagnostics = data[
         [
@@ -145,6 +210,8 @@ def allocate(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def main() -> None:
+    """CLI entry point."""
+
     args = parse_args()
     weights, diagnostics = allocate(args)
 
