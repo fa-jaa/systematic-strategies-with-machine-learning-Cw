@@ -191,7 +191,21 @@ def apply_triple_barrier_labels(
     barriers: pd.DataFrame,
     close: pd.Series,
 ) -> pd.DataFrame:
-    """Apply triple-barrier labels and metalabels to a barrier table."""
+    """
+    Apply triple-barrier outcomes and binary metalabels.
+
+    triple_barrier_label:
+        1  = upper barrier touched first
+       -1  = lower barrier touched first
+        0  = neither horizontal barrier touched before timeout
+
+    metalabel:
+        1 = following the primary signal made money by the touch/timeout date
+        0 = following the primary signal lost money or broke even
+
+    This means timeout rows are not automatically failures.
+    They are labelled using the signed return at timeout.
+    """
 
     close = close.dropna().sort_index()
     labelled = barriers.copy()
@@ -204,14 +218,19 @@ def apply_triple_barrier_labels(
     for _, row in labelled.iterrows():
         start_date = row["date"]
         timeout_date = row["timeout_date"]
+
         upper_barrier = max(row["tp"], row["sl"])
         lower_barrier = min(row["tp"], row["sl"])
 
-        price_path = close.loc[(close.index > start_date) & (close.index <= timeout_date)]
+        price_path = close.loc[
+            (close.index > start_date)
+            & (close.index <= timeout_date)
+        ]
 
+        # Default case: timeout
         label = 0
         touch_date = timeout_date
-        touch_price = row.get("timeout_close", np.nan)
+        touch_price = row["timeout_close"]
         touched_barrier = "timeout"
 
         for current_date, current_close in price_path.items():
@@ -239,9 +258,22 @@ def apply_triple_barrier_labels(
     labelled["touch_price"] = touch_prices
     labelled["touched_barrier"] = touched_barriers
 
-    labelled["metalabel"] = 0
-    correct = labelled["primary_signal"] == labelled["triple_barrier_label"]
-    labelled.loc[correct, "metalabel"] = 1
+    # Return from entry to touch/timeout
+    labelled["raw_touch_return"] = (
+        labelled["touch_price"] / labelled["close"]
+    ) - 1
+
+    # Return from the perspective of following the primary signal
+    labelled["signed_touch_return"] = (
+        labelled["raw_touch_return"] * labelled["primary_signal"]
+    )
+
+    # Final binary meta-label:
+    # 1 if following the primary signal was profitable,
+    # 0 if it was not profitable or exactly flat.
+    labelled["metalabel"] = (
+        labelled["signed_touch_return"] > 0
+    ).astype(int)
 
     return labelled
 
@@ -342,8 +374,14 @@ def run_triple_barrier_pipeline(
     labelled["holding_period_days"] = (
         pd.to_datetime(labelled["touch_date"]) - pd.to_datetime(labelled["date"])
     ).dt.days
-    labelled["raw_touch_return"] = (labelled["touch_price"] / labelled["close"]) - 1
-    labelled["signed_touch_return"] = labelled["raw_touch_return"] * labelled["primary_signal"]
+
+    if "raw_touch_return" not in labelled.columns:
+        labelled["raw_touch_return"] = (labelled["touch_price"] / labelled["close"]) - 1
+
+    if "signed_touch_return" not in labelled.columns:
+        labelled["signed_touch_return"] = (
+            labelled["raw_touch_return"] * labelled["primary_signal"]
+        )
 
     output_columns = [
         "instrument",

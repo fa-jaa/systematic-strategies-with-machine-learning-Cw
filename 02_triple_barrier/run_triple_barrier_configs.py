@@ -118,7 +118,7 @@ for instrument in INSTRUMENTS:
         labels = run_triple_barrier_pipeline(
             instrument=instrument,
             signal_column=instrument,
-            training_end="2022-01-01",
+            training_end="2022-07-01",
             volatility_method=config["volatility_method"],
             ewma_span=config["ewma_span"],
             volatility_window=config["volatility_window"],
