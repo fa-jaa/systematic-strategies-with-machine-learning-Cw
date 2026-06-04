@@ -279,6 +279,35 @@ portfolio_weight_allocation_strategy/outputs/neural_portfolio/neural_feature_wei
 portfolio_weight_allocation_strategy/outputs/neural_portfolio/neural_ticker_bias.csv
 ```
 
+## Compare Fixed and Neural Weights
+
+After generating both strategy outputs, run:
+
+```powershell
+python portfolio_weight_allocation_strategy\visualise_strategy_weights.py
+```
+
+This compares:
+
+```text
+portfolio_weight_allocation_strategy/outputs/strategy_weights.csv
+portfolio_weight_allocation_strategy/outputs/neural_portfolio/neural_strategy_weights.csv
+```
+
+Outputs:
+
+```text
+portfolio_weight_allocation_strategy/outputs/strategy_comparison/fixed_vs_neural_row_comparison.csv
+portfolio_weight_allocation_strategy/outputs/strategy_comparison/daily_exposure_and_pnl.csv
+portfolio_weight_allocation_strategy/outputs/strategy_comparison/strategy_summary.csv
+portfolio_weight_allocation_strategy/outputs/strategy_comparison/instrument_summary.csv
+portfolio_weight_allocation_strategy/outputs/strategy_comparison/daily_gross_exposure.png
+portfolio_weight_allocation_strategy/outputs/strategy_comparison/daily_net_exposure.png
+portfolio_weight_allocation_strategy/outputs/strategy_comparison/cumulative_pnl_proxy.png
+portfolio_weight_allocation_strategy/outputs/strategy_comparison/fixed_vs_neural_weight_scatter.png
+portfolio_weight_allocation_strategy/outputs/strategy_comparison/mean_abs_weight_by_instrument.png
+```
+
 ## Replacing Placeholder Probabilities
 
 When cleaned metamodel probabilities arrive, run:
